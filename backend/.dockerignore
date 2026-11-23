@@ -1,0 +1,25 @@
+# Python virtualenvs & caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local secrets & environment files
+.env
+.env.*
+
+# Git & test artifacts
+.git/
+tests/
+*.db
+*.sqlite
+*.sqlite3
+logs/

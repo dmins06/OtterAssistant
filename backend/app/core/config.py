@@ -29,10 +29,12 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256")
     jwt_access_token_expire_minutes: int = Field(default=60)
 
-    # Database (MySQL 8.0+ — Source of Truth)
+    # Database (MySQL 8.0+ / TiDB Cloud — Source of Truth)
     database_url: str = Field(
         default="mysql+pymysql://otter_user:otter_dev_pw@localhost:3306/otter_assistant?charset=utf8mb4"
     )
+    database_ssl_required: bool = Field(default=False)
+    database_ssl_ca: str = Field(default="")
 
     # Redis (Cache, Rate Limiting, Distributed Locks ONLY)
     redis_url: str = Field(default="redis://localhost:6379/0")

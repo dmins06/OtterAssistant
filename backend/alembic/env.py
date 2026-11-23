@@ -1,15 +1,16 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import pool
+from sqlalchemy.engine.url import make_url
 
 from app.core.config import get_settings
 from app.database.base import Base
+from app.database.session import create_db_engine
 import app.models  # noqa: F401 — register all ORM models on Base.metadata
 
 config = context.config
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -18,7 +19,9 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
+    # Pass SQLAlchemy URL directly instead of ConfigParser set_main_option()
+    # so percent-encoded characters (e.g. %40, %23) in passwords never crash interpolation.
+    url = make_url(settings.database_url)
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -32,11 +35,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    # Reuse the exact same TLS / URL configuration as FastAPI (with NullPool for migrations)
+    connectable = create_db_engine(settings, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(
