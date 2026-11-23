@@ -41,7 +41,7 @@ class Settings(BaseSettings):
 
     # Google Gemini API (Free Tier)
     gemini_api_key: str = Field(default="")
-    gemini_model: str = Field(default="gemini-2.5-flash")
+    gemini_model: str = Field(default="gemini-3.8-flash")
     gemini_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     gemini_max_output_tokens: int = Field(default=1024, ge=1)
 
