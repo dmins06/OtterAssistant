@@ -1,91 +1,404 @@
 # Otter Assistant
 
-> **Your schedule. Your tasks. Your Otter.**
-> AI-Powered Personal Academic Assistant for UTH (University of Transport Ho Chi Minh City) Students.
+<p align="center">
+  <img src="docs/assets/otter-assistant-banner.png" alt="Otter Assistant — Your Personal Academic Assistant" width="100%" />
+</p>
 
-## Architecture Overview
-Otter Assistant is a **Modular Monolith** built for production reliability and strict user data isolation:
+<p align="center">
+  <strong>Your schedule. Your tasks. Your Otter.</strong>
+  <br />
+  An AI-powered personal academic assistant built for students of the University of Transport Ho Chi Minh City (UTH).
+</p>
 
-- **Backend:** Python 3.12+, FastAPI, Pydantic v2, SQLAlchemy 2.x, Alembic, Uvicorn, HTTPX
-- **Database:** MySQL 8.0+ (Source of Truth, UTC timestamps, `utf8mb4`, 14 normalized tables)
-- **Cache & Locking:** Redis 7 (distributed scheduler locks, cache, rate limiting — never long-term academic storage)
-- **AI Agent:** Single Agent + 24 validated backend tools powered by **Google Gemini API (Free Tier)** behind a pluggable `LLMProvider` interface (ready for Ollama)
-- **Messaging:** Telegram Bot API (`@BotFather`) + Secret-Token verified HTTPS Webhook + one-time account linking (`/link <CODE>`)
-- **Scheduler:** APScheduler (`class_reminders`, `assignment_reminders`, `custom_reminders`, `daily_summary`, `weekly_summary`) with Redis distributed locking and MySQL `idempotency_key` duplicate prevention
-- **Frontend:** React 19, TypeScript, Vite, Nginx SPA (7 responsive pages)
+<p align="center">
+  <a href="https://github.com/dmins06/OtterAssistant">
+    <img src="https://img.shields.io/badge/Project-Otter%20Assistant-14b8a6?style=flat-square" alt="Project" />
+  </a>
+  <img src="https://img.shields.io/badge/Python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/FastAPI-Backend-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black" alt="React" />
+  <img src="https://img.shields.io/badge/TypeScript-Frontend-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/MySQL-Database-4479A1?style=flat-square&logo=mysql&logoColor=white" alt="MySQL" />
+  <img src="https://img.shields.io/badge/Redis-Cache-DC382D?style=flat-square&logo=redis&logoColor=white" alt="Redis" />
+  <img src="https://img.shields.io/badge/Docker-Containerization-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT License" />
+</p>
+
+---
+
+## Overview
+
+Otter Assistant is an AI-powered academic management system designed to help university students organize their academic activities through a centralized platform.
+
+The system combines academic data management, AI-assisted interactions, automated reminders, and Telegram integration to provide a more convenient way to keep track of university life.
+
+Rather than functioning as a general-purpose chatbot, Otter Assistant is designed around academic workflows: schedules, subjects, assignments, reminders, and student-specific information.
+
+## Key Features
+
+### Academic Management
+- Manage academic subjects and course information.
+- Organize class schedules based on UTH timetable structures.
+- Track assignments and academic tasks.
+- Detect potential timetable conflicts.
+- Keep academic information organized in one place.
+
+### AI Assistant
+- Interact with an AI assistant powered by Google Gemini.
+- Use a tool-based agent architecture to work with academic data.
+- Support context-aware conversations.
+- Maintain conversation history and memory management.
+- Separate AI provider logic through a pluggable LLM provider interface.
+
+### Automated Notifications
+- Schedule class and assignment reminders.
+- Support custom reminders.
+- Generate daily and weekly academic summaries.
+- Use scheduled background jobs to process notifications.
+- Apply idempotency mechanisms to reduce duplicate notifications.
+
+### Telegram Integration
+- Connect a student account to a Telegram bot.
+- Link accounts using one-time verification codes.
+- Receive academic reminders through Telegram.
+- Process incoming messages through a verified HTTPS webhook.
+
+### Application Security
+- JWT-based authentication.
+- User-isolated data access.
+- Encrypted sensitive integration credentials.
+- Structured logging with sensitive-data redaction.
+- Rate limiting for selected API endpoints.
+- Environment-based configuration.
+
+## Technology Stack
+
+| Layer | Technologies |
+|---|---|
+| Backend | Python 3.12+, FastAPI, Uvicorn |
+| API & Validation | Pydantic v2, HTTPX |
+| ORM & Migrations | SQLAlchemy 2.x, Alembic |
+| Frontend | React 19, TypeScript, Vite |
+| Web Server | Nginx |
+| Database | MySQL 8.0+ |
+| Cache & Distributed Locking | Redis 7 |
+| AI Integration | Google Gemini API, `google-genai` |
+| AI Architecture | Tool-based Agent, LLM Provider Interface |
+| Background Scheduling | APScheduler |
+| Authentication & Security | JWT, Fernet Encryption |
+| Containerization | Docker, Docker Compose |
+| Testing | Pytest |
+| Version Control | Git, GitHub |
+
+## System Architecture
+
+Otter Assistant follows a modular monolith architecture. The backend is organized into independent modules for API handling, business logic, data access, integrations, AI orchestration, and scheduled jobs.
+
+```mermaid
+flowchart TB
+    User[Student]
+    Web[React Frontend]
+    Telegram[Telegram Bot]
+
+    API[FastAPI Backend]
+
+    Auth[Authentication]
+    Academic[Academic Services]
+    Agent[AI Agent]
+    Notification[Notification Service]
+    Scheduler[APScheduler Worker]
+
+    MySQL[(MySQL)]
+    Redis[(Redis)]
+    Gemini[Google Gemini API]
+    UTH[UTH Portal / LMS]
+
+    User --> Web
+    User --> Telegram
+
+    Web --> API
+    Telegram --> API
+
+    API --> Auth
+    API --> Academic
+    API --> Agent
+    API --> Notification
+
+    Agent --> Gemini
+    Agent --> Academic
+
+    Academic --> MySQL
+    Auth --> MySQL
+    Notification --> MySQL
+
+    Scheduler --> MySQL
+    Scheduler --> Redis
+    Scheduler --> Notification
+
+    Academic -.-> UTH
+```
+
+### Architecture Principles
+
+- Modular separation of responsibilities.
+- Centralized configuration through environment variables.
+- SQLAlchemy-based data access.
+- MySQL as the primary source of truth.
+- Redis for caching, rate limiting, and distributed coordination.
+- Independent scheduler worker for background processing.
+- Provider abstraction to reduce coupling between the AI agent and LLM implementation.
 
 ## Project Structure
+
 ```text
-otter-assistant/
+OtterAssistant/
 ├── backend/
 │   ├── app/
-│   │   ├── agents/          # OtterAssistantAgent, GeminiLLMProvider, ConversationMemoryManager, prompts
-│   │   ├── api/             # FastAPI routes & JWT auth dependencies
-│   │   ├── core/            # Config, Fernet encryption, structured JSON redacting logs, middleware
-│   │   ├── database/        # SQLAlchemy 2.x Base, UTC TimestampMixin, session factory
-│   │   ├── integrations/    # portal/ (PortalSessionManager), lms/ (LMSAuthManager, CourseMapping), telegram/
-│   │   ├── models/          # 14 normalized MySQL 8.0+ ORM models
-│   │   ├── notifications/   # NotificationService with idempotency_key duplicate prevention
-│   │   ├── repositories/    # User-isolated data access layer
-│   │   ├── scheduler/       # APScheduler jobs, RedisDistributedLock, standalone worker.py
-│   │   ├── schemas/         # Pydantic v2 request/response DTOs
-│   │   ├── services/        # Subject, Schedule (UTH Buổi/Ca/Tiết + conflict detection), Assignment, Reminder
-│   │   └── tools/           # 24 validated backend tools for AI Agent
-│   ├── alembic/             # MySQL 8.0+ database migrations
-│   └── tests/               # Pytest unit & integration test suite
-├── frontend/                # React + TypeScript + Vite Admin Dashboard + Nginx config
-├── docker-compose.yml       # Local development stack
-├── docker-compose.prod.yml  # Production stack (multi-worker API + dedicated scheduler worker)
+│   │   ├── agents/          # AI agent, LLM providers, prompts, memory
+│   │   ├── api/             # FastAPI routes and dependencies
+│   │   ├── core/            # Configuration, security, logging
+│   │   ├── database/        # SQLAlchemy setup and sessions
+│   │   ├── integrations/    # UTH Portal, LMS, Telegram
+│   │   ├── models/          # Database models
+│   │   ├── notifications/   # Notification services
+│   │   ├── repositories/    # Data access layer
+│   │   ├── scheduler/       # Scheduled jobs and worker
+│   │   ├── schemas/         # Pydantic schemas
+│   │   ├── services/        # Academic business logic
+│   │   └── tools/           # AI agent tools
+│   ├── alembic/             # Database migrations
+│   └── tests/               # Backend tests
+│
+├── frontend/
+│   ├── src/                 # React application
+│   ├── public/              # Static assets
+│   └── ...                  # Vite and Nginx configuration
+│
+├── docs/
+│   └── assets/
+│       └── otter-assistant-banner.png
+│
+├── docker-compose.yml
+├── docker-compose.prod.yml
 ├── .env.example
+├── .gitignore
+├── .gitleaksignore
 └── README.md
 ```
 
-## Quick Start
+## Getting Started
 
-### 1. Configure Environment Variables
+### Prerequisites
+
+Make sure the following tools are installed:
+
+- Python 3.12 or later
+- Node.js and npm
+- Docker Engine
+- Docker Compose
+- Git
+
+You will also need the credentials for the external services you intend to enable, such as Google Gemini and Telegram.
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/dmins06/OtterAssistant.git
+
+cd OtterAssistant
+```
+
+### 2. Configure Environment Variables
+
+Create your local environment file:
+
 ```bash
 cp .env.example .env
-# Generate SECRET_KEY and Fernet ENCRYPTION_KEY:
-python3 -c "import secrets; print('SECRET_KEY=' + secrets.token_urlsafe(32))"
-python3 -c "from cryptography.fernet import Fernet; print('ENCRYPTION_KEY=' + Fernet.generate_key().decode())"
 ```
 
-### 2. Local Development (Docker Compose)
+Open `.env` and configure the required values.
+
+Generate a secure application secret:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Generate a Fernet encryption key:
+
+```bash
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Configure the generated values and the required database, Redis, AI, and Telegram credentials in `.env`.
+
+Do not commit `.env` or expose API keys, tokens, passwords, or encryption keys.
+
+### 3. Start the Application
+
+Build and start the development environment:
+
 ```bash
 docker compose up --build -d
+```
+
+Run database migrations:
+
+```bash
 docker compose exec backend alembic upgrade head
 ```
-- Backend API: `http://localhost:8000` (`/health`, `/health/ready`, `/docs`)
-- Frontend Dashboard: `http://localhost:5173`
 
-### 3. Production Deployment
+### 4. Access the Application
+
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:5173 |
+| Backend API | http://localhost:8000 |
+| API Documentation | http://localhost:8000/docs |
+| Health Check | http://localhost:8000/health |
+| Readiness Check | http://localhost:8000/health/ready |
+
+The available endpoints depend on the application's configuration and deployment environment.
+
+## Running Tests
+
+### Backend
+
+```bash
+cd backend
+
+python3 -m venv .venv
+
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
+pytest -v
+```
+
+### Frontend
+
+```bash
+cd frontend
+
+npm install
+
+npm run typecheck
+
+npm run build
+```
+
+## Production Deployment
+
+A production-oriented Docker Compose configuration is provided:
+
 ```bash
 docker compose -f docker-compose.prod.yml up --build -d
 ```
-Production mode enforces:
-- Non-root container user (`otter`)
-- Startup security guard (`SECRET_KEY`, `ENCRYPTION_KEY`, `APP_DEBUG=false`)
-- Automatic Alembic migration step (`migrate` service) before API/Scheduler boot
-- Dedicated single `scheduler` worker (`python -m app.scheduler.worker`) separated from multi-worker Uvicorn API (`SCHEDULER_ENABLED=false`)
-- Security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`) and sliding-window rate limiting on `/api/v1/auth/*` and `/api/v1/agent/*`
 
-### 4. Running Tests Locally
-```bash
-# Backend tests (Pytest)
-cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pytest -v
+The production configuration is designed to support:
 
-# Frontend typecheck & production build
-cd frontend
-npm install
-npm run typecheck && npm run build
-```
+- A dedicated scheduler worker.
+- Multiple API workers.
+- Database migration before application startup.
+- Non-root container execution.
+- Production configuration checks.
+- Security headers and API rate limiting.
 
-## Production Readiness & Real Integration Checklist (Section 19)
-Before enabling live student traffic, complete these real-credential verifications:
-1. **Portal UTH (`portal.ut.edu.vn`):** Set verified `PORTAL_SCHEDULE_ENDPOINT` (and `PORTAL_REFRESH_ENDPOINT` if supported) in `.env` from an authorized DevTools Network capture, then verify live sync against real student timetable data.
-2. **UTH LMS (`courses.ut.edu.vn`):** Connect via an authorized method (`ical_feed` `.ics` export URL or `moodle_ws` `wstoken`) without bypassing Cloudflare anti-bot challenges, and verify live assignment sync + Course Mapping.
-3. **Google Gemini API (Free Tier):** Set `GEMINI_API_KEY` and `GEMINI_MODEL` in `.env` and confirm Free Tier quota on `aistudio.google.com/rate-limit`.
-4. **Telegram Bot (`@BotFather`):** Configure `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_WEBHOOK_SECRET` in `.env` and register your HTTPS webhook (`setWebhook` with `url=https://<your-domain>/api/v1/webhooks/telegram` and `secret_token=$TELEGRAM_WEBHOOK_SECRET`).
+Before exposing the application to real student traffic, configure and verify all external integrations with authorized credentials.
+
+## External Integrations
+
+| Integration | Purpose |
+|---|---|
+| Google Gemini API | AI-powered conversations and tool execution |
+| UTH Portal | Academic timetable integration |
+| UTH LMS | Course and assignment integration |
+| Telegram Bot API | Notifications and chatbot interaction |
+| MySQL | Persistent academic and application data |
+| Redis | Cache, rate limiting, and distributed locking |
+
+Some integrations require additional configuration and verification against the corresponding external services. Their availability depends on credentials, provider access, and deployment settings.
+
+## Configuration & Security
+
+Otter Assistant uses environment-based configuration to separate application settings from source code.
+
+Important configuration areas include:
+
+- Database connection settings.
+- Redis connection settings.
+- JWT signing secret.
+- Fernet encryption key.
+- Google Gemini API credentials and model selection.
+- Telegram bot credentials and webhook secret.
+- UTH Portal and LMS integration settings.
+- Application environment and debug settings.
+
+Security recommendations:
+
+1. Never commit `.env` files or production credentials.
+2. Use strong, unique secrets for each deployment.
+3. Keep `APP_DEBUG=false` in production.
+4. Restrict database permissions to the minimum required.
+5. Use HTTPS for public-facing services and webhooks.
+6. Rotate exposed credentials immediately.
+7. Review logs and access controls regularly.
+
+## Roadmap
+
+Potential areas for future development:
+
+- Improve academic data synchronization reliability.
+- Expand AI agent capabilities and tool evaluation.
+- Improve assignment tracking and notification workflows.
+- Enhance conversation memory and context management.
+- Add more academic productivity features.
+- Improve monitoring, observability, and automated testing.
+
+## Contributing
+
+Contributions, bug reports, and suggestions are welcome.
+
+1. Fork the repository.
+2. Create a feature branch:
+
+   ```bash
+   git checkout -b feature/your-feature
+   ```
+
+3. Commit your changes:
+
+   ```bash
+   git commit -m "feat: add your feature"
+   ```
+
+4. Push your branch:
+
+   ```bash
+   git push origin feature/your-feature
+   ```
+
+5. Open a Pull Request.
+
+Please keep changes focused, document significant behavior changes, and add tests where appropriate.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Author
+
+**Diminn**
+
+GitHub: [@dmins06](https://github.com/dmins06)
+
+Project Repository: [OtterAssistant](https://github.com/dmins06/OtterAssistant)
+
+---
+
+<p align="center">
+  Built to make academic life more organized, connected, and manageable.
+  <br />
+  <strong>Your schedule. Your tasks. Your Otter.</strong>
+</p>
