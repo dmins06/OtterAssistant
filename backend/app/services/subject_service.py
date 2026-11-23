@@ -20,7 +20,12 @@ class SubjectService:
     def search_subjects(self, user_id: int, query: str) -> list[Subject]:
         return self.repo.search_by_name_or_code(user_id, query)
 
-    def upsert_subject(self, user_id: int, payload: SubjectUpsert) -> Subject:
+    def upsert_subject(
+        self,
+        user_id: int,
+        payload: SubjectUpsert,
+        commit: bool = True,
+    ) -> Subject:
         now = utc_now()
         existing = self.repo.get_by_code(user_id, payload.subject_code)
         if existing:
@@ -34,8 +39,11 @@ class SubjectService:
             if payload.lms_url is not None:
                 existing.lms_url = payload.lms_url
             existing.last_synced_at = now
-            self.db.commit()
-            self.db.refresh(existing)
+            if commit:
+                self.db.commit()
+                self.db.refresh(existing)
+            else:
+                self.db.flush()
             return existing
 
         subject = Subject(
@@ -49,6 +57,9 @@ class SubjectService:
             last_synced_at=now,
         )
         self.repo.add(subject)
-        self.db.commit()
-        self.db.refresh(subject)
+        if commit:
+            self.db.commit()
+            self.db.refresh(subject)
+        else:
+            self.db.flush()
         return subject

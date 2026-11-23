@@ -13,6 +13,7 @@ from app.scheduler.jobs import (
     run_class_reminders,
     run_custom_reminders,
     run_daily_summary,
+    run_portal_semester_sync,
     run_weekly_summary,
 )
 from app.scheduler.locks import RedisDistributedLock
@@ -71,6 +72,12 @@ def create_scheduler() -> BackgroundScheduler:
         lambda: _execute_locked("weekly_summary", run_weekly_summary),
         trigger=CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=settings.app_timezone),
         id="weekly_summary",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: _execute_locked("portal_semester_sync", run_portal_semester_sync),
+        trigger=IntervalTrigger(hours=settings.portal_auto_sync_interval_hours),
+        id="portal_semester_sync",
         replace_existing=True,
     )
     return scheduler

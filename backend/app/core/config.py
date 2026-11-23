@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     portal_refresh_endpoint: str = Field(default="")
     portal_token_refresh_buffer_seconds: int = Field(default=300, ge=30)
     portal_use_mock: bool = Field(default=False)
+    portal_semester_start_date: str = Field(default="")
+    portal_semester_end_date: str = Field(default="")
+    portal_semester_max_weeks: int = Field(default=24, ge=1, le=52)
+    portal_week_request_delay_seconds: float = Field(default=0.3, ge=0.0, le=10.0)
+    portal_auto_sync_interval_hours: int = Field(default=6, ge=1, le=168)
     lms_base_url: str = Field(default="https://courses.ut.edu.vn")
     lms_use_mock: bool = Field(default=False)
 

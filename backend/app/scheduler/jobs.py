@@ -1,15 +1,28 @@
 from datetime import datetime, timedelta, timezone
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
+from app.core.security import SecretEncryptor
 from app.core.timezone import ensure_utc, get_app_tz, utc_now
-from app.models.enums import NotificationType, SubmissionStatus
+from app.integrations.portal.client import MockPortalClient, PortalProvider, UTHPortalHttpClient
+from app.integrations.portal.exceptions import PortalIntegrationError
+from app.integrations.portal.schedule_sync import PortalScheduleSyncService
+from app.integrations.portal.semester import resolve_semester_range
+from app.integrations.portal.session_manager import PortalSessionManager
+from app.integrations.portal.token_manager import PortalTokenManager
+from app.models.connection import PortalConnection
+from app.models.enums import ConnectionStatus, NotificationType, SubmissionStatus, SyncStatus, SyncType
 from app.models.notification import Reminder
 from app.models.user import User, UserPreference
 from app.notifications.service import NotificationService
+from app.scheduler.locks import RedisDistributedLock
 from app.services.assignment_service import AssignmentService
 from app.services.schedule_service import ScheduleService
+
+logger = logging.getLogger(__name__)
 
 
 def _get_active_users_with_prefs(db: Session) -> list[tuple[User, UserPreference | None]]:
@@ -220,3 +233,94 @@ def run_weekly_summary(
         if res.sent:
             sent_count += 1
     return sent_count
+
+
+def run_portal_semester_sync(
+    db: Session,
+    notification_service: NotificationService,
+    *,
+    provider: PortalProvider | None = None,
+    token_manager: PortalTokenManager | None = None,
+    lock_provider: RedisDistributedLock | None = None,
+    now_utc: datetime | None = None,
+    configured_start: str | None = None,
+    configured_end: str | None = None,
+    week_delay_seconds: float | None = None,
+) -> int:
+    """
+    Periodic Auto Semester Schedule Sync job (every 6 hours by default).
+    - Skips cleanly if PORTAL_SEMESTER_END_DATE is not configured (never assumes 16 weeks).
+    - Syncs only active users with AUTHENTICATED / TOKEN_EXPIRING Portal connections.
+    - Notifies users via Telegram (idempotent per day) when Portal JWT requires re-authentication.
+    """
+    now = ensure_utc(now_utc) or utc_now()
+    tz = get_app_tz()
+    today_local = now.astimezone(tz).date()
+
+    try:
+        resolve_semester_range(
+            today=today_local,
+            configured_start=configured_start,
+            configured_end=configured_end,
+        )
+    except PortalIntegrationError as exc:
+        logger.info(
+            "Skipping scheduled Portal semester sync: error_code=%s",
+            exc.error_code,
+        )
+        return 0
+
+    settings = get_settings()
+    portal_provider = provider or (MockPortalClient() if settings.portal_use_mock else UTHPortalHttpClient())
+    tm = token_manager or PortalTokenManager(SecretEncryptor())
+    session_mgr = PortalSessionManager(db=db, provider=portal_provider, token_manager=tm)
+    sync_svc = PortalScheduleSyncService(
+        db=db,
+        provider=portal_provider,
+        session_manager=session_mgr,
+        lock_provider=lock_provider,
+        week_delay_seconds=week_delay_seconds,
+    )
+
+    eligible_conns = list(
+        db.scalars(
+            select(PortalConnection).where(
+                PortalConnection.connection_status.in_(
+                    [ConnectionStatus.AUTHENTICATED, ConnectionStatus.TOKEN_EXPIRING]
+                )
+            )
+        ).all()
+    )
+
+    synced_users = 0
+    for conn in eligible_conns:
+        user = db.scalar(select(User).where(User.id == conn.user_id, User.is_active.is_(True)))
+        if user is None:
+            continue
+
+        result = sync_svc.sync_semester_schedules(
+            user.id,
+            sync_type=SyncType.SCHEDULED,
+            today=today_local,
+            configured_start=configured_start,
+            configured_end=configured_end,
+        )
+        if result.status in (SyncStatus.SUCCESS, SyncStatus.PARTIAL):
+            synced_users += 1
+
+        if result.reauth_required:
+            notification_service.send_notification(
+                user_id=user.id,
+                event_id=f"portal:reauth:{today_local.isoformat()}",
+                notification_type=NotificationType.PORTAL_SESSION_EXPIRED,
+                scheduled_for=datetime(
+                    today_local.year, today_local.month, today_local.day, 0, 0, tzinfo=tz
+                ).astimezone(timezone.utc),
+                message_text=(
+                    "[Portal UTH] Phiên đăng nhập Portal UTH của bạn đã hết hạn nên Otter chưa thể "
+                    "tự động đồng bộ lịch học kỳ.\n"
+                    "Vui lòng mở Otter Dashboard → Tích hợp → Portal UTH để cập nhật JWT mới."
+                ),
+            )
+
+    return synced_users

@@ -95,6 +95,25 @@ def sync_portal_schedule(
     return PortalSyncResponse(**result.__dict__)
 
 
+@router.post("/sync-semester", response_model=PortalSyncResponse)
+def sync_portal_semester_schedule(
+    payload: PortalSyncRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    provider: PortalProvider = Depends(get_portal_provider),
+    manager: PortalSessionManager = Depends(get_portal_session_manager),
+) -> PortalSyncResponse:
+    req = payload or PortalSyncRequest()
+    sync_service = PortalScheduleSyncService(db=db, provider=provider, session_manager=manager)
+    result = sync_service.sync_semester_schedules(
+        user_id=current_user.id,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        sync_type=SyncType.FULL,
+    )
+    return PortalSyncResponse(**result.__dict__)
+
+
 @router.get("/sync-logs", response_model=list[SyncLogResponse])
 def list_portal_sync_logs(
     limit: int = Query(default=20, ge=1, le=100),

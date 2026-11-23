@@ -82,7 +82,12 @@ class ScheduleService:
                         )
         return conflicts
 
-    def upsert_schedule(self, user_id: int, payload: ScheduleUpsert) -> Schedule:
+    def upsert_schedule(
+        self,
+        user_id: int,
+        payload: ScheduleUpsert,
+        commit: bool = True,
+    ) -> Schedule:
         subject = self.subject_repo.get_by_id(user_id, payload.subject_id)
         if subject is None:
             raise PermissionError("Subject not found or does not belong to current user.")
@@ -113,8 +118,11 @@ class ScheduleService:
                 existing.lms_url = payload.lms_url
             existing.is_deleted = payload.is_deleted
             existing.last_synced_at = now
-            self.db.commit()
-            self.db.refresh(existing)
+            if commit:
+                self.db.commit()
+                self.db.refresh(existing)
+            else:
+                self.db.flush()
             return existing
 
         schedule = Schedule(
@@ -139,6 +147,9 @@ class ScheduleService:
             last_synced_at=now,
         )
         self.repo.add(schedule)
-        self.db.commit()
-        self.db.refresh(schedule)
+        if commit:
+            self.db.commit()
+            self.db.refresh(schedule)
+        else:
+            self.db.flush()
         return schedule

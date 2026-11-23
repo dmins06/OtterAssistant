@@ -8,6 +8,7 @@ import httpx
 import jwt
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.logging import SensitiveDataFilter, redact_sensitive
@@ -26,8 +27,13 @@ from app.integrations.portal.schedule_sync import PortalScheduleSyncService
 from app.integrations.portal.session_manager import PortalSessionManager
 from app.integrations.portal.token_manager import PortalTokenManager
 from app.models.academic import Schedule, Subject
+from app.models.connection import SyncLog
 from app.models.enums import ConnectionStatus, SessionPeriod, SyncStatus
 from app.models.user import User
+from app.schemas.schedule import ScheduleUpsert
+from app.schemas.subject import SubjectUpsert
+from app.services.schedule_service import ScheduleService
+from app.services.subject_service import SubjectService
 
 
 def _make_jwt(exp_delta_seconds: int = 3600) -> str:
@@ -333,3 +339,366 @@ def test_lms_url_sanitization_dedup_suspended_and_no_secret_logging(
     combined_logs = "\n".join(rec.getMessage() for rec in caplog.records)
     assert secret_jwt not in combined_logs
     assert secret_lms_token not in combined_logs
+
+
+def test_portal_sync_atomic_rollback_on_mid_loop_failure_and_isolated_sync_log(
+    db_session: Session,
+    two_users: tuple[User, User],
+) -> None:
+    user_a, _ = two_users
+    tm = _make_token_manager()
+    valid_jwt = _make_jwt(3600)
+
+    # Seed an existing schedule inside the target week to verify it is NOT soft-deleted on rollback
+    existing_subject = SubjectService(db_session).upsert_subject(
+        user_a.id,
+        SubjectUpsert(subject_code="EXISTING01", name="Môn học đã có"),
+    )
+    ScheduleService(db_session).upsert_schedule(
+        user_a.id,
+        ScheduleUpsert(
+            subject_id=existing_subject.id,
+            source_event_id="existing-evt-1",
+            class_date=date(2026, 11, 24),
+            weekday=3,
+            session=SessionPeriod.MORNING,
+            class_session="Ca 2",
+            period_start=4,
+            period_end=6,
+            start_time=time(9, 25),
+            end_time=time(11, 55),
+            room="B303",
+            campus="CS1",
+        ),
+    )
+
+    events = [
+        _sample_event(id=8001, maMonHoc="NEW001", tenMonHoc="Môn mới 1", ngayBatDauHoc="23/11/2026"),
+        _sample_event(id=8002, maMonHoc="NEW002", tenMonHoc="Môn mới 2", ngayBatDauHoc="25/11/2026"),
+    ]
+    client = UTHPortalHttpClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json=_envelope(events)))
+    )
+    manager = PortalSessionManager(db_session, client, tm, sleep_fn=lambda _: None)
+    manager.connect_with_token(user_a.id, valid_jwt)
+    sync_svc = PortalScheduleSyncService(db_session, client, manager)
+
+    # Inject a mid-loop failure on the 2nd schedule upsert (after 1st subject + schedule were flushed)
+    original_upsert = sync_svc.schedule_service.upsert_schedule
+    call_count = 0
+
+    def failing_on_second(uid: int, payload: ScheduleUpsert, commit: bool = True) -> Schedule:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("Simulated DB write failure mid-sync")
+        return original_upsert(uid, payload, commit=commit)
+
+    sync_svc.schedule_service.upsert_schedule = failing_on_second  # type: ignore[method-assign]
+
+    failed_res = sync_svc.sync_schedules(
+        user_a.id,
+        start_date=date(2026, 11, 23),
+        end_date=date(2026, 11, 29),
+    )
+    assert failed_res.status == SyncStatus.FAILED
+    assert failed_res.items_added == 0
+    assert failed_res.error_code == "PORTAL_SYNC_TRANSACTION_ERROR"
+
+    # 1. Partial writes (NEW001 / 8001) MUST be completely rolled back
+    subjects_after_fail = list(db_session.scalars(select(Subject).where(Subject.user_id == user_a.id)).all())
+    assert [s.subject_code for s in subjects_after_fail] == ["EXISTING01"]
+
+    schedules_after_fail = list(
+        db_session.scalars(select(Schedule).where(Schedule.user_id == user_a.id)).all()
+    )
+    assert len(schedules_after_fail) == 1
+    assert schedules_after_fail[0].source_event_id == "existing-evt-1"
+    assert schedules_after_fail[0].is_deleted is False
+
+    # 2. SyncLog MUST be persisted as FAILED (not rolled back or stuck in RUNNING)
+    failed_log = db_session.get(SyncLog, failed_res.sync_log_id)
+    assert failed_log is not None
+    assert failed_log.status == SyncStatus.FAILED
+    assert failed_log.finished_at is not None
+    assert failed_log.error_code == "PORTAL_SYNC_TRANSACTION_ERROR"
+
+    # 3. Restore normal upsert -> subsequent sync commits atomically and marks SyncLog=SUCCESS
+    sync_svc.schedule_service.upsert_schedule = original_upsert  # type: ignore[method-assign]
+    ok_res = sync_svc.sync_schedules(
+        user_a.id,
+        start_date=date(2026, 11, 23),
+        end_date=date(2026, 11, 29),
+    )
+    assert ok_res.status == SyncStatus.SUCCESS
+    assert ok_res.items_added == 2
+    assert ok_res.items_removed == 1  # existing-evt-1 soft-deleted now that sync succeeded
+
+    ok_log = db_session.get(SyncLog, ok_res.sync_log_id)
+    assert ok_log is not None
+    assert ok_log.status == SyncStatus.SUCCESS
+    assert ok_log.finished_at is not None
+
+
+def test_portal_sync_final_commit_failure_rolls_back_soft_delete_and_marks_sync_log_failed(
+    db_session: Session,
+    two_users: tuple[User, User],
+) -> None:
+    user_a, _ = two_users
+    tm = _make_token_manager()
+    valid_jwt = _make_jwt(3600)
+
+    # Seed existing schedule inside [2026-11-23, 2026-11-25] so Transaction 2 will mark it is_deleted=True
+    existing_subject = SubjectService(db_session).upsert_subject(
+        user_a.id,
+        SubjectUpsert(subject_code="EXISTING02", name="Môn học cũ"),
+    )
+    ScheduleService(db_session).upsert_schedule(
+        user_a.id,
+        ScheduleUpsert(
+            subject_id=existing_subject.id,
+            source_event_id="existing-evt-commit-fail",
+            class_date=date(2026, 11, 24),
+            weekday=3,
+            session=SessionPeriod.MORNING,
+            class_session="Ca 2",
+            period_start=4,
+            period_end=6,
+            start_time=time(9, 25),
+            end_time=time(11, 55),
+            room="C007",
+            campus="CS1",
+        ),
+    )
+
+    events = [
+        _sample_event(id=9101, maMonHoc="COMMITNEW1", tenMonHoc="Môn mới A", ngayBatDauHoc="23/11/2026"),
+        _sample_event(id=9102, maMonHoc="COMMITNEW2", tenMonHoc="Môn mới B", ngayBatDauHoc="25/11/2026"),
+    ]
+    client = UTHPortalHttpClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json=_envelope(events)))
+    )
+    manager = PortalSessionManager(db_session, client, tm, sleep_fn=lambda _: None)
+    manager.connect_with_token(user_a.id, valid_jwt)
+    sync_svc = PortalScheduleSyncService(db_session, client, manager)
+
+    # Commit #1: Transaction 1 (SyncLog=RUNNING) -> succeeds
+    # Commit #2: Transaction 2 final commit (after upserts + soft-delete) -> fails ONCE with SQLAlchemyError
+    # Commit #3: Transaction 3 (_mark_sync_log_failed) -> succeeds
+    real_commit = db_session.commit
+    commit_calls = 0
+
+    def fail_only_on_transaction_2_commit() -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 2:
+            raise SQLAlchemyError("Simulated commit failure on Transaction 2")
+        real_commit()
+
+    db_session.commit = fail_only_on_transaction_2_commit  # type: ignore[method-assign]
+    try:
+        res = sync_svc.sync_schedules(
+            user_a.id,
+            start_date=date(2026, 11, 23),
+            end_date=date(2026, 11, 29),
+        )
+    finally:
+        db_session.commit = real_commit  # type: ignore[method-assign]
+
+    assert commit_calls == 3
+    assert res.status == SyncStatus.FAILED
+    assert res.items_added == 0
+    assert res.items_updated == 0
+    assert res.items_removed == 0
+
+    # New subjects & schedules MUST NOT exist
+    subjects = list(db_session.scalars(select(Subject).where(Subject.user_id == user_a.id)).all())
+    assert [s.subject_code for s in subjects] == ["EXISTING02"]
+
+    schedules = list(db_session.scalars(select(Schedule).where(Schedule.user_id == user_a.id)).all())
+    assert len(schedules) == 1
+    assert schedules[0].source_event_id == "existing-evt-commit-fail"
+    assert schedules[0].is_deleted is False  # Soft-delete rolled back completely
+
+    # SyncLog MUST be persisted as FAILED with finished_at set
+    log_row = db_session.get(SyncLog, res.sync_log_id)
+    assert log_row is not None
+    assert log_row.status == SyncStatus.FAILED
+    assert log_row.finished_at is not None
+
+
+def test_portal_sync_unexpected_fetch_exception_marks_sync_log_failed(
+    db_session: Session,
+    two_users: tuple[User, User],
+) -> None:
+    user_a, _ = two_users
+    tm = _make_token_manager()
+    valid_jwt = _make_jwt(3600)
+
+    class ExplodingProvider(UTHPortalHttpClient):
+        def fetch_weekly_schedule(self, access_token, start_date, end_date, csrf_token=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError("Unexpected runtime bug during fetch")
+
+    provider = ExplodingProvider()
+    manager = PortalSessionManager(db_session, provider, tm, sleep_fn=lambda _: None)
+    manager.connect_with_token(user_a.id, valid_jwt)
+    sync_svc = PortalScheduleSyncService(db_session, provider, manager)
+
+    res = sync_svc.sync_schedules(
+        user_a.id,
+        start_date=date(2026, 11, 23),
+        end_date=date(2026, 11, 29),
+    )
+    assert res.status == SyncStatus.FAILED
+    assert res.error_code == "PORTAL_FETCH_UNEXPECTED_ERROR"
+
+    log_row = db_session.get(SyncLog, res.sync_log_id)
+    assert log_row is not None
+    assert log_row.status == SyncStatus.FAILED
+    assert log_row.error_code == "PORTAL_FETCH_UNEXPECTED_ERROR"
+    assert log_row.finished_at is not None
+
+
+def test_portal_sync_fetch_exception_preserved_when_mark_sync_log_failed_errors(
+    db_session: Session,
+    two_users: tuple[User, User],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user_a, _ = two_users
+    tm = _make_token_manager()
+    secret_jwt = _make_jwt(3600)
+
+    class ExplodingProvider(UTHPortalHttpClient):
+        def fetch_weekly_schedule(self, access_token, start_date, end_date, csrf_token=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError(f"Unexpected fetch error with token={secret_jwt}")
+
+    provider = ExplodingProvider()
+    manager = PortalSessionManager(db_session, provider, tm, sleep_fn=lambda _: None)
+    manager.connect_with_token(user_a.id, secret_jwt)
+    sync_svc = PortalScheduleSyncService(db_session, provider, manager)
+
+    # Commit #1: Transaction 1 (SyncLog=RUNNING) succeeds
+    # Commit #2: Transaction 3 (_mark_sync_log_failed) ALSO fails with SQLAlchemyError
+    real_commit = db_session.commit
+    commit_calls = 0
+
+    def fail_on_mark_failed_commit() -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 2:
+            raise SQLAlchemyError("Secondary DB failure while updating SyncLog")
+        real_commit()
+
+    caplog.handler.addFilter(SensitiveDataFilter())
+    db_session.commit = fail_on_mark_failed_commit  # type: ignore[method-assign]
+    try:
+        with caplog.at_level(logging.WARNING):
+            res = sync_svc.sync_schedules(
+                user_a.id,
+                start_date=date(2026, 11, 23),
+                end_date=date(2026, 11, 29),
+            )
+    finally:
+        db_session.commit = real_commit  # type: ignore[method-assign]
+
+    # Primary failure MUST be preserved (not replaced by secondary SQLAlchemyError)
+    assert commit_calls == 2
+    assert res.status == SyncStatus.FAILED
+    assert res.error_code == "PORTAL_FETCH_UNEXPECTED_ERROR"
+    assert "RuntimeError" in (res.error_message or "")
+
+    # Verify primary failure was logged BEFORE secondary failure, and zero secret leaked
+    messages = [rec.getMessage() for rec in caplog.records]
+    primary_idx = next(i for i, m in enumerate(messages) if "PORTAL_FETCH_UNEXPECTED_ERROR" in m)
+    secondary_idx = next(i for i, m in enumerate(messages) if "Secondary failure while marking Portal SyncLog" in m)
+    assert primary_idx < secondary_idx
+    assert secret_jwt not in "\n".join(messages)
+
+
+def test_portal_sync_tx2_commit_failure_preserved_when_mark_sync_log_failed_errors(
+    db_session: Session,
+    two_users: tuple[User, User],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user_a, _ = two_users
+    tm = _make_token_manager()
+    secret_jwt = _make_jwt(3600)
+
+    existing_subject = SubjectService(db_session).upsert_subject(
+        user_a.id,
+        SubjectUpsert(subject_code="EXISTING03", name="Môn cũ bền vững"),
+    )
+    ScheduleService(db_session).upsert_schedule(
+        user_a.id,
+        ScheduleUpsert(
+            subject_id=existing_subject.id,
+            source_event_id="existing-evt-double-fail",
+            class_date=date(2026, 11, 24),
+            weekday=3,
+            session=SessionPeriod.MORNING,
+            class_session="Ca 2",
+            period_start=4,
+            period_end=6,
+            start_time=time(9, 25),
+            end_time=time(11, 55),
+            room="C007",
+            campus="CS1",
+        ),
+    )
+
+    events = [
+        _sample_event(id=9201, maMonHoc="DBLNEW1", tenMonHoc="Môn mới 1", ngayBatDauHoc="23/11/2026"),
+        _sample_event(id=9202, maMonHoc="DBLNEW2", tenMonHoc="Môn mới 2", ngayBatDauHoc="25/11/2026"),
+    ]
+    client = UTHPortalHttpClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json=_envelope(events)))
+    )
+    manager = PortalSessionManager(db_session, client, tm, sleep_fn=lambda _: None)
+    manager.connect_with_token(user_a.id, secret_jwt)
+    sync_svc = PortalScheduleSyncService(db_session, client, manager)
+
+    # Commit #1: Transaction 1 (SyncLog=RUNNING) succeeds
+    # Commit #2: Transaction 2 final commit fails with SQLAlchemyError
+    # Commit #3: Transaction 3 (_mark_sync_log_failed) ALSO fails with SQLAlchemyError
+    real_commit = db_session.commit
+    commit_calls = 0
+
+    def fail_on_tx2_and_tx3_commits() -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls in (2, 3):
+            raise SQLAlchemyError(f"Simulated DB commit error #{commit_calls}")
+        real_commit()
+
+    caplog.handler.addFilter(SensitiveDataFilter())
+    db_session.commit = fail_on_tx2_and_tx3_commits  # type: ignore[method-assign]
+    try:
+        with caplog.at_level(logging.WARNING):
+            res = sync_svc.sync_schedules(
+                user_a.id,
+                start_date=date(2026, 11, 23),
+                end_date=date(2026, 11, 29),
+            )
+    finally:
+        db_session.commit = real_commit  # type: ignore[method-assign]
+
+    # Primary Transaction 2 failure preserved; no unhandled secondary exception
+    assert commit_calls == 3
+    assert res.status == SyncStatus.FAILED
+    assert res.error_code == "PORTAL_SYNC_TRANSACTION_ERROR"
+
+    # Transaction 2 changes (new subject, new schedule, soft-delete) MUST be rolled back
+    subjects = list(db_session.scalars(select(Subject).where(Subject.user_id == user_a.id)).all())
+    assert [s.subject_code for s in subjects] == ["EXISTING03"]
+
+    schedules = list(db_session.scalars(select(Schedule).where(Schedule.user_id == user_a.id)).all())
+    assert len(schedules) == 1
+    assert schedules[0].source_event_id == "existing-evt-double-fail"
+    assert schedules[0].is_deleted is False
+
+    # Primary warning logged before secondary error, and zero secret leaked
+    messages = [rec.getMessage() for rec in caplog.records]
+    primary_idx = next(i for i, m in enumerate(messages) if "Portal sync transaction rolled back" in m)
+    secondary_idx = next(i for i, m in enumerate(messages) if "Secondary failure while marking Portal SyncLog" in m)
+    assert primary_idx < secondary_idx
+    assert secret_jwt not in "\n".join(messages)

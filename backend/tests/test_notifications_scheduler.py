@@ -166,6 +166,7 @@ def test_scheduler_jobs_class_assignment_custom_and_summaries(
         "custom_reminders",
         "daily_summary",
         "weekly_summary",
+        "portal_semester_sync",
     }
 
 

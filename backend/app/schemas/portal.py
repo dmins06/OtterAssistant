@@ -41,6 +41,10 @@ class PortalSyncResponse(BaseModel):
     items_removed: int
     error_code: str | None = None
     error_message: str | None = None
+    weeks_total: int = 1
+    weeks_succeeded: int = 0
+    weeks_failed: int = 0
+    reauth_required: bool = False
 
 
 class SyncLogResponse(BaseModel):
