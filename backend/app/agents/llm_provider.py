@@ -10,6 +10,60 @@ from app.core.logging import redact_sensitive
 
 logger = logging.getLogger(__name__)
 
+_MAX_LOG_ERROR_MESSAGE_LEN = 300
+
+
+def _classify_gemini_status(http_status: int | None) -> str:
+    if http_status == 400:
+        return "bad_request"
+    if http_status == 401:
+        return "unauthorized"
+    if http_status == 403:
+        return "forbidden"
+    if http_status == 404:
+        return "not_found"
+    if http_status == 429:
+        return "rate_limited"
+    if http_status is not None and 500 <= http_status <= 599:
+        return "server_error"
+    return "unknown"
+
+
+def _sanitize_gemini_error_message(message: str | None, api_key: str) -> str:
+    if not message:
+        return ""
+    sanitized = " ".join(str(message).split())
+    if api_key:
+        sanitized = sanitized.replace(api_key, "[REDACTED_API_KEY]")
+    sanitized = redact_sensitive(sanitized)
+    if len(sanitized) > _MAX_LOG_ERROR_MESSAGE_LEN:
+        return f"{sanitized[:_MAX_LOG_ERROR_MESSAGE_LEN]}..."
+    return sanitized
+
+
+def _extract_gemini_error_info(
+    exc: Exception,
+    api_key: str,
+) -> tuple[int | None, str | None, str, str]:
+    raw_code = getattr(exc, "code", None)
+    if raw_code is None:
+        raw_code = getattr(exc, "status_code", None)
+    http_status: int | None = None
+    if isinstance(raw_code, int):
+        http_status = raw_code
+    elif isinstance(raw_code, str) and raw_code.isdigit():
+        http_status = int(raw_code)
+
+    raw_status = getattr(exc, "status", None)
+    error_code = str(raw_status) if raw_status else None
+
+    raw_message = getattr(exc, "message", None)
+    if raw_message is None:
+        raw_message = str(exc)
+    safe_message = _sanitize_gemini_error_message(str(raw_message), api_key)
+    category = _classify_gemini_status(http_status)
+    return http_status, error_code, category, safe_message
+
 
 class LLMProviderError(Exception):
     """Base error raised by LLM providers."""
@@ -172,15 +226,56 @@ class GeminiLLMProvider(LLMProvider):
                 self._sleep(delay)
                 delay *= 2
             except Exception as exc:
-                status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                http_status, error_code, category, safe_message = _extract_gemini_error_info(
+                    exc,
+                    self.api_key,
+                )
                 err_text = str(exc).lower()
-                is_rate_limit = status_code == 429 or "429" in err_text or "resource_exhausted" in err_text
+                is_rate_limit = (
+                    http_status == 429
+                    or (error_code or "").upper() == "RESOURCE_EXHAUSTED"
+                    or "429" in err_text
+                    or "resource_exhausted" in err_text
+                )
                 if is_rate_limit:
+                    effective_status = http_status or 429
+                    effective_code = error_code or "RESOURCE_EXHAUSTED"
                     if attempt >= self.max_retries:
+                        logger.warning(
+                            "Gemini API error: category=rate_limited http_status=%s error_code=%s "
+                            "exception=%s model=%s message=%s",
+                            effective_status,
+                            effective_code,
+                            type(exc).__name__,
+                            self.model,
+                            safe_message,
+                        )
                         raise LLMRateLimitError("Gemini Free Tier rate limit / quota exceeded.") from exc
-                    logger.warning("Gemini 429 rate limit; backing off %.1fs", delay)
+                    logger.warning(
+                        "Gemini API rate limit: category=rate_limited http_status=%s error_code=%s "
+                        "exception=%s model=%s retry_in=%.1fs attempt=%d",
+                        effective_status,
+                        effective_code,
+                        type(exc).__name__,
+                        self.model,
+                        delay,
+                        attempt + 1,
+                    )
                     self._sleep(delay)
                     delay *= 2
                     continue
-                raise LLMProviderError(f"Gemini API error: {type(exc).__name__}") from exc
+                logger.error(
+                    "Gemini API error: category=%s http_status=%s error_code=%s "
+                    "exception=%s model=%s message=%s",
+                    category,
+                    http_status,
+                    error_code,
+                    type(exc).__name__,
+                    self.model,
+                    safe_message,
+                )
+                raise LLMProviderError(
+                    f"Gemini API error: {type(exc).__name__} "
+                    f"(category={category}, http_status={http_status}, error_code={error_code})"
+                ) from exc
         raise LLMRateLimitError("Gemini Free Tier rate limit exceeded.")

@@ -12,6 +12,7 @@ _SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'("?(?:password|passwd|secret|api_key|access_token|refresh_token|authorization|cookie|wstoken)"?\s*[:=]\s*"?)([^",\s}]+)', re.IGNORECASE), r"\1[REDACTED]"),
     (re.compile(r'([?&](?:token|access_token|wstoken|jwt|auth|key|secret|sesskey)=)([^&\s"\']+)', re.IGNORECASE), r"\1[REDACTED]"),
     (re.compile(r"(/bot)(\d+:[A-Za-z0-9_\-]+)"), r"\1[REDACTED_TG_TOKEN]"),
+    (re.compile(r"\bAIza[0-9A-Za-z\-_]{20,}\b"), "[REDACTED_API_KEY]"),
 ]
 
 

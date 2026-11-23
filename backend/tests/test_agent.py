@@ -1,13 +1,17 @@
 from datetime import date, time
+import logging
 from typing import Any
 
 from fastapi.testclient import TestClient
+from google.genai import errors as genai_errors
+import pytest
 from sqlalchemy.orm import Session
 
 from app.agents.assistant import OtterAssistantAgent
 from app.agents.llm_provider import (
     GeminiLLMProvider,
     LLMProvider,
+    LLMProviderError,
     LLMRateLimitError,
     LLMResponse,
     ToolCallRequest,
@@ -229,3 +233,124 @@ def test_agent_chat_api_endpoint(
     hist = client.get("/api/v1/agent/history", headers=auth_headers(user_a))
     assert hist.status_code == 200
     assert len(hist.json()) == 2
+
+
+@pytest.mark.parametrize(
+    ("exc_cls", "http_status", "api_status", "expected_category", "raw_message"),
+    [
+        (
+            genai_errors.ClientError,
+            400,
+            "INVALID_ARGUMENT",
+            "bad_request",
+            "API key not valid for AIzaSyFakeSecretGeminiKey1234567890",
+        ),
+        (
+            genai_errors.ClientError,
+            401,
+            "UNAUTHENTICATED",
+            "unauthorized",
+            "Request is missing required authentication credential.",
+        ),
+        (
+            genai_errors.ClientError,
+            403,
+            "PERMISSION_DENIED",
+            "forbidden",
+            "Generative Language API has not been used in project.",
+        ),
+        (
+            genai_errors.ClientError,
+            404,
+            "NOT_FOUND",
+            "not_found",
+            "models/gemini-2.5-flash is not found for API version v1beta.",
+        ),
+        (
+            genai_errors.ServerError,
+            503,
+            "UNAVAILABLE",
+            "server_error",
+            "The model is overloaded. Please try again later.",
+        ),
+    ],
+)
+def test_gemini_error_logging_classifies_status_and_redacts_api_key(
+    caplog: pytest.LogCaptureFixture,
+    exc_cls: type[genai_errors.APIError],
+    http_status: int,
+    api_status: str,
+    expected_category: str,
+    raw_message: str,
+) -> None:
+    fake_key = "AIzaSyFakeSecretGeminiKey1234567890"
+
+    class FailingGemini(GeminiLLMProvider):
+        def _call_sdk(self, system_prompt, messages, tool_declarations):  # type: ignore[no-untyped-def]
+            raise exc_cls(
+                http_status,
+                {"error": {"code": http_status, "status": api_status, "message": raw_message}},
+            )
+
+    provider = FailingGemini(api_key=fake_key, model="gemini-2.5-flash", max_retries=0)
+    with caplog.at_level(logging.ERROR, logger="app.agents.llm_provider"):
+        with pytest.raises(LLMProviderError) as exc_info:
+            provider.generate("sys", [{"role": "user", "content": "hi"}], [])
+
+    err_str = str(exc_info.value)
+    assert f"category={expected_category}" in err_str
+    assert f"http_status={http_status}" in err_str
+    assert f"error_code={api_status}" in err_str
+    assert fake_key not in err_str
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert f"category={expected_category}" in log_output
+    assert f"http_status={http_status}" in log_output
+    assert f"error_code={api_status}" in log_output
+    assert f"exception={exc_cls.__name__}" in log_output
+    assert fake_key not in log_output
+
+
+def test_gemini_429_exhausted_logs_rate_limited_and_preserves_fallback(
+    db_session: Session,
+    two_users: tuple[User, User],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user_a, _ = two_users
+    fake_key = "AIzaSyFakeSecretGeminiKey9999999999"
+    slept: list[float] = []
+
+    class RateLimitedGemini(GeminiLLMProvider):
+        def _call_sdk(self, system_prompt, messages, tool_declarations):  # type: ignore[no-untyped-def]
+            raise genai_errors.ClientError(
+                429,
+                {
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": f"Quota exceeded for key={fake_key}",
+                    }
+                },
+            )
+
+    provider = RateLimitedGemini(
+        api_key=fake_key,
+        model="gemini-2.5-flash",
+        max_retries=1,
+        base_delay_seconds=0.5,
+        sleep_fn=lambda d: slept.append(d),
+    )
+    agent = OtterAssistantAgent(db_session, llm_provider=provider)
+    with caplog.at_level(logging.WARNING, logger="app.agents"):
+        reply = agent.chat(user_a, "Hôm nay học gì?")
+
+    assert slept == [0.5]
+    assert reply.degraded is True
+    assert "Gemini Free Tier" in reply.reply_text
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "category=rate_limited" in log_output
+    assert "http_status=429" in log_output
+    assert "error_code=RESOURCE_EXHAUSTED" in log_output
+    assert "exception=ClientError" in log_output
+    assert fake_key not in log_output
