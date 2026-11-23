@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage/
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime data & logs
+logs/
+data/
+runtime/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.log
+npm-debug.log*
+
+# Environment & Secrets (NEVER commit secrets)
+.env
+.env.local
+.env.*
+.env.*.local
+!.env.example
+*.pem
+*.key
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# TypeScript build cache
+*.tsbuildinfo
