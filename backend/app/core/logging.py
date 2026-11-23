@@ -11,6 +11,7 @@ _SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"), "[REDACTED_JWT]"),
     (re.compile(r'("?(?:password|passwd|secret|api_key|access_token|refresh_token|authorization|cookie|wstoken)"?\s*[:=]\s*"?)([^",\s}]+)', re.IGNORECASE), r"\1[REDACTED]"),
     (re.compile(r'([?&](?:token|access_token|wstoken|jwt|auth|key|secret|sesskey)=)([^&\s"\']+)', re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(/bot)(\d+:[A-Za-z0-9_\-]+)"), r"\1[REDACTED_TG_TOKEN]"),
 ]
 
 
@@ -66,3 +67,5 @@ def configure_logging(level: str = "INFO") -> None:
     handler.setFormatter(StructuredJsonFormatter())
     handler.addFilter(SensitiveDataFilter())
     root_logger.addHandler(handler)
+    # Prevent httpx from logging full request URLs (which include Telegram bot tokens) at INFO level.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

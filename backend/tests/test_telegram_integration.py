@@ -1,12 +1,15 @@
+import logging
 from unittest.mock import patch
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app.agents.llm_provider import LLMProvider, LLMResponse, ToolCallRequest
 from app.api.routes.agent import get_llm_provider
 from app.api.routes.telegram import get_telegram_client
 from app.core.config import Settings
-from app.integrations.telegram.client import MockTelegramBotClient
+from app.integrations.telegram.client import MockTelegramBotClient, TelegramBotClient
 from app.models.enums import NotificationStatus
 from app.models.user import User
 from tests.conftest import auth_headers
@@ -170,3 +173,167 @@ def test_telegram_one_time_linking_agent_reply_and_unlink(
         client.get("/api/v1/integrations/telegram/status", headers=auth_headers(user_a)).json()["linked"]
         is False
     )
+
+
+def test_telegram_client_missing_token_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
+    tg_client = TelegramBotClient(bot_token="")
+    with caplog.at_level(logging.WARNING, logger="app.integrations.telegram.client"):
+        result = tg_client.send_message("99001", "Hello Otter")
+
+    assert result.ok is False
+    assert result.status == NotificationStatus.FAILED
+    assert result.error_code == "TELEGRAM_BOT_TOKEN_MISSING"
+    assert any(
+        record.levelno == logging.WARNING and "TELEGRAM_BOT_TOKEN" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_telegram_client_http_401_logs_error_without_token(caplog: pytest.LogCaptureFixture) -> None:
+    fake_token = "123456789:FAKE_SECRET_BOT_TOKEN_401"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            401,
+            json={"ok": False, "error_code": 401, "description": "Unauthorized"},
+        )
+    )
+    tg_client = TelegramBotClient(bot_token=fake_token, transport=transport)
+
+    with caplog.at_level(logging.WARNING, logger="app.integrations.telegram.client"):
+        result = tg_client.send_message("99001", "Secret body text")
+
+    assert result.ok is False
+    assert result.status == NotificationStatus.FAILED
+    assert result.error_code == "TELEGRAM_401"
+    assert result.error_detail == "Unauthorized"
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "http_status=401" in log_output
+    assert "error_code=401" in log_output
+    assert "Unauthorized" in log_output
+    assert fake_token not in log_output
+    assert "Secret body text" not in log_output
+
+
+def test_telegram_client_http_403_logs_error_without_token(caplog: pytest.LogCaptureFixture) -> None:
+    fake_token = "123456789:FAKE_SECRET_BOT_TOKEN_403"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            403,
+            json={
+                "ok": False,
+                "error_code": 403,
+                "description": "Forbidden: bot was blocked by the user",
+            },
+        )
+    )
+    tg_client = TelegramBotClient(bot_token=fake_token, transport=transport)
+
+    with caplog.at_level(logging.WARNING, logger="app.integrations.telegram.client"):
+        result = tg_client.send_message("99001", "Blocked message body")
+
+    assert result.ok is False
+    assert result.status == NotificationStatus.POLICY_RESTRICTED
+    assert result.error_code == "TELEGRAM_403_BLOCKED"
+    assert result.error_detail == "Forbidden: bot was blocked by the user"
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "http_status=403" in log_output
+    assert "error_code=403" in log_output
+    assert "Forbidden: bot was blocked by the user" in log_output
+    assert fake_token not in log_output
+    assert "Blocked message body" not in log_output
+
+
+def test_telegram_client_success_logs_message_id_without_token(caplog: pytest.LogCaptureFixture) -> None:
+    fake_token = "123456789:FAKE_SECRET_BOT_TOKEN_200"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"ok": True, "result": {"message_id": 4242}},
+        )
+    )
+    tg_client = TelegramBotClient(bot_token=fake_token, transport=transport)
+
+    with caplog.at_level(logging.INFO, logger="app.integrations.telegram.client"):
+        result = tg_client.send_message("99001", "Private welcome text")
+
+    assert result.ok is True
+    assert result.status == NotificationStatus.SENT
+    assert result.message_id == "4242"
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "message_id=4242" in log_output
+    assert fake_token not in log_output
+    assert "Private welcome text" not in log_output
+
+
+def test_telegram_client_network_error_does_not_leak_url_or_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_token = "123456789:FAKE_SECRET_BOT_TOKEN_NET"
+
+    def _raise_connect_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"Failed connecting to {request.url}", request=request)
+
+    tg_client = TelegramBotClient(
+        bot_token=fake_token,
+        transport=httpx.MockTransport(_raise_connect_error),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.integrations.telegram.client"):
+        result = tg_client.send_message("99001", "Network test")
+
+    assert result.ok is False
+    assert result.status == NotificationStatus.FAILED
+    assert result.error_code == "TELEGRAM_NETWORK_ERROR"
+    assert result.error_detail == "ConnectError"
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "ConnectError" in log_output
+    assert fake_token not in log_output
+    assert "api.telegram.org" not in log_output
+
+
+def test_telegram_start_logs_delivery_failure_without_leaking_content(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_token = "123456789:FAKE_SECRET_BOT_TOKEN_START"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            401,
+            json={"ok": False, "error_code": 401, "description": "Unauthorized"},
+        )
+    )
+    failing_tg = TelegramBotClient(bot_token=fake_token, transport=transport)
+    client.app.dependency_overrides[get_telegram_client] = lambda: failing_tg  # type: ignore[attr-defined]
+    client.app.dependency_overrides[get_llm_provider] = lambda: _FakeTelegramAgentLLM()  # type: ignore[attr-defined]
+
+    update_payload = {
+        "update_id": 20001,
+        "message": {
+            "chat": {"id": 88001},
+            "from": {"id": 88001, "username": "uth_student"},
+            "text": "/start",
+        },
+    }
+    with caplog.at_level(logging.WARNING, logger="app.integrations.telegram"):
+        resp = client.post("/api/v1/webhooks/telegram", json=update_payload)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"handled": True, "command": "start"}
+
+    handler_logs = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "app.integrations.telegram.message_handler"
+    )
+    assert "command=start" in handler_logs
+    assert "status=FAILED" in handler_logs
+    assert "error_code=TELEGRAM_401" in handler_logs
+    assert "error_detail=Unauthorized" in handler_logs
+
+    all_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert fake_token not in all_logs
+    assert "Chào mừng bạn đến với Otter Assistant" not in all_logs

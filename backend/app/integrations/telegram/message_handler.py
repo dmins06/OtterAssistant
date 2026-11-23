@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.agents.assistant import OtterAssistantAgent
 from app.agents.llm_provider import LLMProvider
 from app.core.timezone import utc_now
-from app.integrations.telegram.client import TelegramProvider
+from app.integrations.telegram.client import TelegramDeliveryResult, TelegramProvider
 from app.integrations.telegram.linking import TelegramAccountLinkingService
 from app.models.user import AccountLinking, User
 
@@ -53,11 +53,12 @@ class TelegramMessageHandler:
             parts = text.split(None, 1)
             if len(parts) == 2 and parts[1].strip():
                 return self._process_link_command(chat_id, parts[1].strip(), display_name)
-            self.telegram_client.send_message(
+            self._send_and_log(
                 chat_id,
                 "Chào mừng bạn đến với Otter Assistant (UTH)!\n"
                 "Để liên kết tài khoản sinh viên, hãy mở Otter Dashboard → Tích hợp → Telegram Bot, "
                 "tạo mã liên kết và gửi: /link <MÃ_LIÊN_KẾT>",
+                command="start",
             )
             return {"handled": True, "command": "start"}
 
@@ -65,9 +66,10 @@ class TelegramMessageHandler:
         if text.lower().startswith("/link"):
             parts = text.split(None, 1)
             if len(parts) < 2 or not parts[1].strip():
-                self.telegram_client.send_message(
+                self._send_and_log(
                     chat_id,
                     "Cú pháp đúng: /link <MÃ_LIÊN_KẾT> (ví dụ: /link OTTER-1A2B3C).",
+                    command="link",
                 )
                 return {"handled": True, "linked": False}
             return self._process_link_command(chat_id, parts[1].strip(), display_name)
@@ -84,9 +86,17 @@ class TelegramMessageHandler:
             if linking:
                 linking.is_active = False
                 self.db.commit()
-                self.telegram_client.send_message(chat_id, "Đã hủy liên kết Telegram với Otter Assistant.")
+                self._send_and_log(
+                    chat_id,
+                    "Đã hủy liên kết Telegram với Otter Assistant.",
+                    command="unlink",
+                )
             else:
-                self.telegram_client.send_message(chat_id, "Telegram của bạn hiện chưa liên kết tài khoản nào.")
+                self._send_and_log(
+                    chat_id,
+                    "Telegram của bạn hiện chưa liên kết tài khoản nào.",
+                    command="unlink",
+                )
             return {"handled": True, "command": "unlink"}
 
         # Route normal text to OtterAssistantAgent
@@ -98,10 +108,11 @@ class TelegramMessageHandler:
             )
         )
         if linking is None:
-            self.telegram_client.send_message(
+            self._send_and_log(
                 chat_id,
                 "Tài khoản Telegram của bạn chưa liên kết với Otter Assistant.\n"
                 "Vui lòng mở Otter Dashboard → Tích hợp → Telegram Bot để lấy mã và gửi: /link <MÃ_LIÊN_KẾT>",
+                command="unlinked",
             )
             return {"handled": True, "linked": False}
 
@@ -115,17 +126,44 @@ class TelegramMessageHandler:
         agent = OtterAssistantAgent(db=self.db, llm_provider=self.llm_provider)
         reply = agent.chat(user=user, message=text, channel="telegram")
         delivery = self.telegram_client.send_message(chat_id, reply.reply_text)
-        logger.info(
-            "Telegram reply dispatched for user_id=%s status=%s",
-            user.id,
-            delivery.status.value,
-        )
+        if delivery.ok:
+            logger.info(
+                "Telegram reply dispatched for user_id=%s status=%s",
+                user.id,
+                delivery.status.value,
+            )
+        else:
+            logger.warning(
+                "Telegram reply failed for user_id=%s status=%s error_code=%s error_detail=%s",
+                user.id,
+                delivery.status.value,
+                delivery.error_code,
+                delivery.error_detail,
+            )
         return {
             "handled": True,
             "user_id": user.id,
             "delivery_status": delivery.status.value,
             "tools_used": reply.tools_used,
         }
+
+    def _send_and_log(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        command: str,
+    ) -> TelegramDeliveryResult:
+        delivery = self.telegram_client.send_message(chat_id, text)
+        if not delivery.ok:
+            logger.warning(
+                "Telegram command reply failed: command=%s status=%s error_code=%s error_detail=%s",
+                command,
+                delivery.status.value,
+                delivery.error_code,
+                delivery.error_detail,
+            )
+        return delivery
 
     def _process_link_command(
         self,
@@ -135,14 +173,16 @@ class TelegramMessageHandler:
     ) -> dict[str, Any]:
         linked = self.linking_service.consume_link_code(code, chat_id, display_name=display_name)
         if linked is None:
-            self.telegram_client.send_message(
+            self._send_and_log(
                 chat_id,
                 "Mã liên kết không hợp lệ hoặc đã hết hạn. Vui lòng tạo mã mới trên Otter Dashboard.",
+                command="link",
             )
             return {"handled": True, "linked": False}
-        self.telegram_client.send_message(
+        self._send_and_log(
             chat_id,
             "Liên kết tài khoản Otter Assistant thành công! "
             "Bạn có thể hỏi lịch học, deadline, tạo nhắc nhở và nhận thông báo tự động ngay trên Telegram.",
+            command="link",
         )
         return {"handled": True, "linked": True, "user_id": linked.user_id}

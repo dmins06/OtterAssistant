@@ -33,13 +33,16 @@ class TelegramBotClient:
         self,
         bot_token: str | None = None,
         timeout_seconds: float = 15.0,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         settings = get_settings()
         self.bot_token = bot_token if bot_token is not None else settings.telegram_bot_token
         self.timeout_seconds = timeout_seconds
+        self._transport = transport
 
     def send_message(self, chat_id: str, text: str) -> TelegramDeliveryResult:
         if not self.bot_token:
+            logger.warning("Telegram sendMessage skipped: TELEGRAM_BOT_TOKEN is not configured.")
             return TelegramDeliveryResult(
                 ok=False,
                 status=NotificationStatus.FAILED,
@@ -54,7 +57,7 @@ class TelegramBotClient:
             "disable_web_page_preview": True,
         }
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            with httpx.Client(timeout=self.timeout_seconds, transport=self._transport) as client:
                 response = client.post(url, json=payload)
                 data: dict[str, Any] = response.json()
         except Exception as exc:
@@ -68,14 +71,22 @@ class TelegramBotClient:
 
         if data.get("ok") is True:
             msg_id = (data.get("result") or {}).get("message_id")
+            message_id = str(msg_id) if msg_id is not None else None
+            logger.info("Telegram sendMessage succeeded: message_id=%s", message_id)
             return TelegramDeliveryResult(
                 ok=True,
                 status=NotificationStatus.SENT,
-                message_id=str(msg_id) if msg_id is not None else None,
+                message_id=message_id,
             )
 
         err_code = int(data.get("error_code", response.status_code))
         description = str(data.get("description", "Telegram API error"))
+        logger.warning(
+            "Telegram sendMessage failed: http_status=%s error_code=%s description=%s",
+            response.status_code,
+            err_code,
+            description,
+        )
         if err_code == 403:
             return TelegramDeliveryResult(
                 ok=False,
